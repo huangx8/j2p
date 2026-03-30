@@ -1,0 +1,13 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+/tmp/j2p_workspace/
+*.egg-info/
+dist/
+build/
+.claude/
+.idea/
+
