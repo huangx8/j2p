@@ -336,22 +336,35 @@ def reply_to_issue_comment(
     )
 
 
+_OWN_COMMENT_PREFIXES = (
+    "addressed in ",
+    "no code changes required",
+)
+
+
+def _is_own_comment(body: str) -> bool:
+    """Return True if this comment was posted by j2p itself."""
+    normalised = body.strip().lower()
+    return any(normalised.startswith(p) for p in _OWN_COMMENT_PREFIXES)
+
+
 def has_new_comments_since(
     repo_full_name: str, pr_number: int, known_comment_ids: set[int]
 ) -> tuple[bool, list[ReviewComment]]:
     """
     Returns (has_new, new_comments_list).
     Filters out:
-    - Comments already in known_comment_ids (i.e. already addressed)
-    - j2p's own reply/acknowledgement comments
+    - Comments already in known_comment_ids (already addressed)
+    - j2p's own acknowledgement comments (body matches own-comment prefixes)
+    - Inline reply comments (in_reply_to_id is set) — these are always bot replies
     """
     all_comments = get_pr_review_comments(repo_full_name, pr_number)
 
-    _OWN_PREFIXES = ("Addressed in ", "No code changes required")
     new = [
         c for c in all_comments
         if c.comment_id not in known_comment_ids
-        and not any(c.body.startswith(p) for p in _OWN_PREFIXES)
+        and not _is_own_comment(c.body)
+        and c.in_reply_to_id is None
     ]
     return len(new) > 0, new
 

@@ -1,4 +1,5 @@
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Literal
 
 from langgraph.graph import StateGraph, END
@@ -304,17 +305,17 @@ def clarification_node(state: AgentState) -> AgentState:
 def coding_node(state: AgentState) -> AgentState:
     ticket = state.get("jira_ticket") or {}
     existing_prs: list[dict] = state.get("prs") or []
-    review_feedback: str | None = None
 
-    if state.get("review_iteration", 0) > 0 and state.get("review_comments"):
-        lines = []
-        for c in state["review_comments"]:
-            location = f" (in `{c['path']}` line {c['line']})" if c.get("path") else ""
-            lines.append(f"- **{c['author']}**{location}: {c['body']}")
-        review_feedback = "\n".join(lines)
+    # Build per-repo review feedback from review comments
+    review_comments_all: list[dict] = state.get("review_comments") or []
+    is_review_round = state.get("review_iteration", 0) > 0 and bool(review_comments_all)
 
-    # Derive repos and branch from ticket when available, otherwise fall back to
-    # the PR list already in state (e.g. when pr_check_node bypassed jira_node).
+    # Group comments by repo so each worker only sees its own feedback
+    comments_by_repo: dict[str, list[dict]] = {}
+    for c in review_comments_all:
+        comments_by_repo.setdefault(c.get("repo", ""), []).append(c)
+
+    # Derive repos and branch
     if ticket.get("repos"):
         repos: list[str] = ticket["repos"]
         branch_name: str = ticket["key"].lower()
@@ -322,11 +323,10 @@ def coding_node(state: AgentState) -> AgentState:
         repos = list(dict.fromkeys(p["repo_full_name"] for p in existing_prs))
         branch_name = existing_prs[0]["branch_name"] if existing_prs else state["jira_ticket_key"].lower()
 
-    # If we still have no ticket metadata, fetch it now so Claude has context
-    if not ticket and review_feedback:
+    # Lazily fetch ticket when bypassed by pr_check_node fast-path
+    if not ticket and is_review_round:
         print("[coding_node] jira_ticket not in state — fetching ticket for coding context ...")
         try:
-            from jira_client import fetch_jira_ticket
             fetched = fetch_jira_ticket(state["jira_ticket_key"])
             ticket = {
                 "key": fetched.key,
@@ -339,95 +339,116 @@ def coding_node(state: AgentState) -> AgentState:
             print(f"[coding_node] Warning: could not fetch ticket: {e}. Proceeding with empty context.")
             ticket = {"key": state["jira_ticket_key"], "summary": "", "description": "", "repos": repos, "labels": []}
 
-    updated_prs = list(existing_prs)
-    new_history: list[dict] = list(state.get("coding_messages") or [])
+    # Snapshot existing PR map for read-only lookups inside threads
+    existing_pr_map: dict[str, dict] = {p["repo_full_name"]: p for p in existing_prs}
 
-    for repo_full_name in repos:
-        print(f"[coding_node] Processing repo: {repo_full_name}")
+    # Each worker returns either an updated pr dict or raises
+    def _process_repo(repo_full_name: str) -> dict:
+        print(f"[coding_node] [{repo_full_name}] Starting ...")
 
-        # If an open PR already exists for this repo's branch, skip coding
-        if not any(p["repo_full_name"] == repo_full_name for p in updated_prs):
+        # If a PR already exists and this is not a review round, skip coding
+        if repo_full_name in existing_pr_map and not is_review_round:
             existing_pr = find_existing_pr(repo_full_name, branch_name)
             if existing_pr:
-                print(f"[coding_node] Open PR #{existing_pr.pr_number} already exists for {repo_full_name} — skipping coding.")
-                updated_prs.append({
+                print(f"[coding_node] [{repo_full_name}] Open PR #{existing_pr.pr_number} already exists — skipping.")
+                return {
                     "repo_full_name": repo_full_name,
                     "branch_name": branch_name,
                     "pr_number": existing_pr.pr_number,
                     "pr_url": existing_pr.pr_url,
                     "head_sha": existing_pr.head_sha,
                     "is_draft": existing_pr.is_draft,
-                    "known_comment_ids": [],
-                })
-                continue
+                    "known_comment_ids": list(existing_pr_map[repo_full_name].get("known_comment_ids") or []),
+                }
 
         local_path = clone_repo(repo_full_name, branch_name)
 
-        commit_summary, new_history = run_coding_agent(
+        # Build review feedback string scoped to this repo only
+        repo_comments = comments_by_repo.get(repo_full_name, [])
+        repo_review_feedback: str | None = None
+        if is_review_round and repo_comments:
+            lines = []
+            for c in repo_comments:
+                location = f" (in `{c['path']}` line {c['line']})" if c.get("path") else ""
+                lines.append(f"- **{c['author']}**{location}: {c['body']}")
+            repo_review_feedback = "\n".join(lines)
+
+        commit_summary, _ = run_coding_agent(
             repo_path=local_path,
-            ticket_summary=ticket["summary"],
-            ticket_description=ticket["description"],
-            review_feedback=review_feedback,
-            conversation_history=list(new_history),
+            ticket_summary=ticket.get("summary", ""),
+            ticket_description=ticket.get("description", ""),
+            review_feedback=repo_review_feedback,
+            conversation_history=[],
         )
 
         sha = commit_and_push(local_path, branch_name, commit_summary)
-        no_changes = (commit_summary == "NO_CHANGES_NEEDED") or (sha is None and review_feedback)
 
         if sha:
-            print(f"[coding_node] Pushed {sha[:8]} to {repo_full_name}:{branch_name}")
+            print(f"[coding_node] [{repo_full_name}] Pushed {sha[:8]}")
         elif commit_summary == "NO_CHANGES_NEEDED":
-            print(f"[coding_node] Claude indicated no code changes needed for {repo_full_name}.")
+            print(f"[coding_node] [{repo_full_name}] No code changes needed.")
         else:
-            print(f"[coding_node] No changes made to {repo_full_name} — skipping PR update.")
+            print(f"[coding_node] [{repo_full_name}] No changes to commit.")
 
-        # Reply to and mark all review comments as addressed — whether or not a
-        # commit was pushed. Comments that need no code change must still be
-        # acknowledged so review_watcher_node does not re-surface them.
-        if review_feedback and state.get("review_comments"):
-            pr_entry = next((p for p in updated_prs if p["repo_full_name"] == repo_full_name), None)
-            if pr_entry and "pr_number" in pr_entry:
-                reply_text = sha[:8] if sha else "No code changes required"
-                known_ids = set(pr_entry.get("known_comment_ids") or [])
-                for c in state["review_comments"]:
-                    if c.get("repo") != repo_full_name:
-                        continue
-                    try:
-                        if c.get("path"):
-                            reply_to_review_comment(
-                                repo_full_name, pr_entry["pr_number"],
-                                c["comment_id"], reply_text,
-                            )
-                        else:
-                            reply_to_issue_comment(
-                                repo_full_name, pr_entry["pr_number"],
-                                reply_text,
-                            )
-                        known_ids.add(c["comment_id"])
-                        print(f"[coding_node] Replied to comment #{c['comment_id']} with '{reply_text}'")
-                    except Exception as e:
-                        print(f"[coding_node] Warning: could not reply to comment #{c['comment_id']}: {e}")
-                pr_entry["known_comment_ids"] = list(known_ids)
+        # Build the updated pr entry from the existing one (if any)
+        pr_entry: dict = {
+            **(existing_pr_map.get(repo_full_name) or {}),
+            "repo_full_name": repo_full_name,
+            "branch_name": branch_name,
+            "local_path": local_path,
+            "commit_summary": commit_summary,
+        }
+        if sha:
+            pr_entry["head_sha"] = sha
 
-        if not any(p["repo_full_name"] == repo_full_name for p in updated_prs):
-            # Always track the repo so pr_node can find/create a PR for it
-            updated_prs.append({
-                "repo_full_name": repo_full_name,
-                "branch_name": branch_name,
-                "local_path": local_path,
-                "commit_summary": commit_summary,
-            })
-        else:
-            # Update commit summary if new commits were pushed
-            if sha:
-                for p in updated_prs:
-                    if p["repo_full_name"] == repo_full_name:
-                        p["commit_summary"] = commit_summary
+        # Reply to addressed review comments
+        if repo_review_feedback and repo_comments and "pr_number" in pr_entry:
+            reply_text = sha[:8] if sha else "No code changes required"
+            known_ids = set(pr_entry.get("known_comment_ids") or [])
+            for c in repo_comments:
+                try:
+                    if c.get("path"):
+                        reply_to_review_comment(
+                            repo_full_name, pr_entry["pr_number"],
+                            c["comment_id"], reply_text,
+                        )
+                    else:
+                        reply_to_issue_comment(
+                            repo_full_name, pr_entry["pr_number"],
+                            reply_text,
+                        )
+                    known_ids.add(c["comment_id"])
+                    print(f"[coding_node] [{repo_full_name}] Replied to comment #{c['comment_id']} with '{reply_text}'")
+                except Exception as e:
+                    print(f"[coding_node] [{repo_full_name}] Warning: could not reply to comment #{c['comment_id']}: {e}")
+            pr_entry["known_comment_ids"] = list(known_ids)
+
+        return pr_entry
+
+    # Run all repos concurrently
+    print(f"[coding_node] Processing {len(repos)} repo(s) concurrently ...")
+    results: dict[str, dict] = {}
+    with ThreadPoolExecutor(max_workers=max(len(repos), 1)) as executor:
+        future_to_repo = {executor.submit(_process_repo, repo): repo for repo in repos}
+        for future in as_completed(future_to_repo):
+            repo = future_to_repo[future]
+            exc = future.exception()
+            if exc:
+                print(f"[coding_node] [{repo}] ERROR: {exc}")
+            else:
+                results[repo] = future.result()
+
+    # Merge: repos in order, then any existing PR entries for repos not in this run
+    seen: set[str] = set(repos)
+    updated_prs: list[dict] = [results[r] for r in repos if r in results]
+    for p in existing_prs:
+        if p["repo_full_name"] not in seen:
+            updated_prs.append(p)
 
     return {
         **state,
         "prs": updated_prs,
-        "coding_messages": new_history,
+        "coding_messages": [],
         "status": "pr_pending",
     }
 
@@ -443,46 +464,60 @@ def pr_node(state: AgentState) -> AgentState:
         "---\n_This PR was automatically generated by j2p._"
     )
 
-    updated_prs = []
-    for pr_data in state.get("prs") or []:
+    prs_in = list(state.get("prs") or [])
+
+    def _ensure_pr(pr_data: dict) -> dict:
         repo = pr_data["repo_full_name"]
         branch = pr_data["branch_name"]
 
         if "pr_number" in pr_data:
-            print(f"[pr_node] PR #{pr_data['pr_number']} for {repo} updated via push.")
-            updated_prs.append(pr_data)
-        else:
-            # Check if a PR already exists for this branch before creating one
-            existing = find_existing_pr(repo, branch)
-            if existing:
-                print(f"[pr_node] Found existing PR #{existing.pr_number} for {repo}: {existing.pr_url}")
-                updated_prs.append({
-                    **pr_data,
-                    "pr_number": existing.pr_number,
-                    "pr_url": existing.pr_url,
-                    "head_sha": existing.head_sha,
-                    "is_draft": existing.is_draft,
-                    "known_comment_ids": [],
-                })
-            else:
-                print(f"[pr_node] Creating draft PR for {repo} ...")
-                pr_info = create_pull_request(
-                    repo_full_name=repo,
-                    branch_name=branch,
-                    title=pr_title,
-                    body=pr_body,
-                    local_repo_path=pr_data.get("local_path"),
-                )
-                print(f"[pr_node] Draft PR created: {pr_info.pr_url}")
-                updated_prs.append({
-                    **pr_data,
-                    "pr_number": pr_info.pr_number,
-                    "pr_url": pr_info.pr_url,
-                    "head_sha": pr_info.head_sha,
-                    "is_draft": pr_info.is_draft,
-                    "known_comment_ids": [],
-                })
+            print(f"[pr_node] [{repo}] PR #{pr_data['pr_number']} already exists.")
+            return pr_data
 
+        existing = find_existing_pr(repo, branch)
+        if existing:
+            print(f"[pr_node] [{repo}] Found existing PR #{existing.pr_number}: {existing.pr_url}")
+            return {
+                **pr_data,
+                "pr_number": existing.pr_number,
+                "pr_url": existing.pr_url,
+                "head_sha": existing.head_sha,
+                "is_draft": existing.is_draft,
+                "known_comment_ids": [],
+            }
+
+        print(f"[pr_node] [{repo}] Creating draft PR ...")
+        pr_info = create_pull_request(
+            repo_full_name=repo,
+            branch_name=branch,
+            title=pr_title,
+            body=pr_body,
+            local_repo_path=pr_data.get("local_path"),
+        )
+        print(f"[pr_node] [{repo}] Draft PR created: {pr_info.pr_url}")
+        return {
+            **pr_data,
+            "pr_number": pr_info.pr_number,
+            "pr_url": pr_info.pr_url,
+            "head_sha": pr_info.head_sha,
+            "is_draft": pr_info.is_draft,
+            "known_comment_ids": [],
+        }
+
+    print(f"[pr_node] Creating/verifying {len(prs_in)} PR(s) concurrently ...")
+    results_map: dict[str, dict] = {}
+    with ThreadPoolExecutor(max_workers=max(len(prs_in), 1)) as executor:
+        future_to_repo = {executor.submit(_ensure_pr, pr_data): pr_data["repo_full_name"] for pr_data in prs_in}
+        for future in as_completed(future_to_repo):
+            repo = future_to_repo[future]
+            exc = future.exception()
+            if exc:
+                print(f"[pr_node] [{repo}] ERROR creating PR: {exc}")
+            else:
+                results_map[repo] = future.result()
+
+    # Preserve input order
+    updated_prs = [results_map[p["repo_full_name"]] for p in prs_in if p["repo_full_name"] in results_map]
 
     return {**state, "prs": updated_prs, "status": "pr_created"}
 

@@ -4,8 +4,8 @@ main.py — Entry point for j2p agent.
 
 Usage:
     python main.py --ticket PROJ-123
-    python main.py --ticket PROJ-123 --thread-id my-run-id   # resume a run
-    python main.py --ticket PROJ-123 --repo org/repo1 --repo org/repo2  # override repos
+    python main.py --ticket PROJ-123 --thread-id my-run-id
+    python main.py --ticket PROJ-123 --repo org/repo1,org/repo2
 """
 
 import argparse
@@ -33,20 +33,23 @@ def main():
     parser.add_argument(
         "--repo",
         dest="repos",
-        action="append",
-        default=[],
-        metavar="OWNER/REPO",
+        default="",
+        metavar="OWNER/REPO[,OWNER/REPO,...]",
         help=(
-            "GitHub repository to target, e.g. myorg/myrepo. "
-            "Can be repeated to specify multiple repos. "
+            "Comma-separated list of GitHub repositories to target, "
+            "e.g. myorg/repo1,myorg/repo2. "
             "When provided these repos are used instead of (or merged with) "
             "any repos found in the JIRA ticket description."
         ),
     )
     args = parser.parse_args()
 
-    # Qualify any bare repo names using the default org
-    extra_repos = [_qualify_repo(r.strip()) for r in args.repos if r.strip()]
+    # Split comma-separated repos and qualify any bare names
+    extra_repos = [
+        _qualify_repo(r.strip())
+        for r in args.repos.split(",")
+        if r.strip()
+    ]
 
     # Validate config
     config.validate()
