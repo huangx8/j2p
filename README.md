@@ -94,11 +94,11 @@ source .venv/bin/activate
 # Basic
 python main.py --ticket PROJ-123
 
-# Override / supply repos explicitly (skips repo extraction from ticket)
-python main.py --ticket PROJ-123 --repo myorg/repo1 --repo myorg/repo2
+# Supply repos explicitly (comma-separated)
+python main.py --ticket PROJ-123 --repo myorg/repo1,myorg/repo2
 
 # Bare names are auto-qualified using GITHUB_DEFAULT_ORG
-python main.py --ticket PROJ-123 --repo repo1 --repo repo2
+python main.py --ticket PROJ-123 --repo repo1,repo2
 
 # Resume a previous run
 python main.py --ticket PROJ-123 --thread-id <thread-id>

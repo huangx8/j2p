@@ -1,6 +1,7 @@
 import re
 import sys
 import json
+import time
 import threading
 import subprocess
 from config import config
@@ -182,10 +183,11 @@ def build_agent_prompt(sections: dict[str, str], summary: str, description: str)
     return "\n\n".join(parts)
 
 
-def fetch_jira_ticket(ticket_key: str) -> JiraTicket:
+def fetch_jira_ticket(ticket_key: str, max_retries: int = 3, retry_delay: float = 5.0) -> JiraTicket:
     """
     Fetch a JIRA ticket via the Claude Code CLI (which has JIRA MCP access).
     Asks Claude to return the ticket fields as JSON, then parses the result.
+    Retries up to max_retries times on failure (MCP can be unstable).
     """
     prompt = (
         f"Use the atlassian MCP to fetch ticket {ticket_key}. "
@@ -193,38 +195,55 @@ def fetch_jira_ticket(ticket_key: str) -> JiraTicket:
         f"summary, description, labels (array of strings), assignee (string or null). "
         f"No explanation, no markdown fences - raw JSON only."
     )
-    raw = _run_claude(prompt)
 
-    json_match = re.search(r"\{.*\}", raw, re.DOTALL)
-    if not json_match:
-        raise RuntimeError(f"Could not parse JSON from claude output:\n{raw}")
-    data = json.loads(json_match.group())
+    last_error: Exception | None = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            if attempt > 1:
+                print(f"[jira] Retry {attempt}/{max_retries} fetching {ticket_key} (waiting {retry_delay}s)...", flush=True)
+                time.sleep(retry_delay)
 
-    summary = data.get("summary", "")
-    description = data.get("description", "")
-    labels = data.get("labels", [])
-    assignee = data.get("assignee")
+            raw = _run_claude(prompt)
 
-    sections = _extract_sections(description)
+            json_match = re.search(r"\{.*\}", raw, re.DOTALL)
+            if not json_match:
+                raise RuntimeError(f"Could not parse JSON from claude output:\n{raw}")
+            data = json.loads(json_match.group())
+        except (RuntimeError, json.JSONDecodeError, ValueError) as exc:
+            last_error = exc
+            print(f"[jira] Attempt {attempt}/{max_retries} failed: {exc}", file=sys.stderr, flush=True)
+            continue
 
-    repos: list[str] = []
-    for heading in ("affected repositories", "repositories", "repos"):
-        if heading in sections:
-            repos = extract_repos_from_text(sections[heading])
-            break
-    if not repos:
-        repos = extract_repos_from_text(description)
+        summary = data.get("summary", "")
+        description = data.get("description", "")
+        labels = data.get("labels", [])
+        assignee = data.get("assignee")
 
-    repos = list(set(repos))
-    agent_description = build_agent_prompt(sections, summary, description)
+        sections = _extract_sections(description)
 
-    return JiraTicket(
-        key=ticket_key,
-        summary=summary,
-        description=agent_description,
-        repos=repos,
-        labels=labels,
-        assignee=assignee,
+        repos: list[str] = []
+        for heading in ("affected repositories", "repositories", "repos"):
+            if heading in sections:
+                repos = extract_repos_from_text(sections[heading])
+                break
+        if not repos:
+            repos = extract_repos_from_text(description)
+
+        repos = list(set(repos))
+        agent_description = build_agent_prompt(sections, summary, description)
+
+        return JiraTicket(
+            key=ticket_key,
+            summary=summary,
+            description=agent_description,
+            repos=repos,
+            labels=labels,
+            assignee=assignee,
+        )
+
+    raise RuntimeError(
+        f"Failed to fetch JIRA ticket {ticket_key} after {max_retries} attempts. "
+        f"Last error: {last_error}"
     )
 
 
