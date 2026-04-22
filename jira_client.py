@@ -45,7 +45,6 @@ def _run_claude(prompt: str, cwd: str | None = None) -> str:
         [
             config.CLAUDE_CLI_PATH,
             "--print",
-            "--debug",
             "--permission-mode", "bypassPermissions",
             "--allowedTools", "mcp__atlassian",
         ],

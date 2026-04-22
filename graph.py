@@ -1,4 +1,5 @@
 import time
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Literal
 
@@ -13,6 +14,7 @@ from github_client import (
     commit_and_push,
     create_pull_request,
     find_existing_pr,
+    get_pr_state,
     has_new_comments_since,
     is_pr_merged_or_closed,
     is_pr_draft,
@@ -69,12 +71,11 @@ def pr_check_node(state: AgentState) -> AgentState:
     if not repos_to_check:
         return {**state, "status": "init"}
 
-    existing_prs: list[dict] = []
-    for repo_full_name in repos_to_check:
+    def _check_repo_pr(repo_full_name: str) -> dict | None:
         pr_info = find_existing_pr(repo_full_name, branch_name)
         if pr_info:
             print(f"[pr_check_node] Found existing open PR #{pr_info.pr_number} for {repo_full_name}: {pr_info.pr_url}")
-            existing_prs.append({
+            return {
                 "repo_full_name": repo_full_name,
                 "branch_name": branch_name,
                 "pr_number": pr_info.pr_number,
@@ -82,7 +83,20 @@ def pr_check_node(state: AgentState) -> AgentState:
                 "head_sha": pr_info.head_sha,
                 "is_draft": pr_info.is_draft,
                 "known_comment_ids": [],
-            })
+            }
+        return None
+
+    existing_prs: list[dict] = []
+    with ThreadPoolExecutor(max_workers=max(len(repos_to_check), 1)) as executor:
+        futures = {executor.submit(_check_repo_pr, r): r for r in repos_to_check}
+        for future in as_completed(futures):
+            result = future.result()
+            if result:
+                existing_prs.append(result)
+
+    # Restore original order
+    order = {r: i for i, r in enumerate(repos_to_check)}
+    existing_prs.sort(key=lambda p: order.get(p["repo_full_name"], 999))
 
     if existing_prs:
         return {
@@ -348,22 +362,25 @@ def coding_node(state: AgentState) -> AgentState:
 
         # If a PR already exists and this is not a review round, skip coding
         if repo_full_name in existing_pr_map and not is_review_round:
-            existing_pr = find_existing_pr(repo_full_name, branch_name)
-            if existing_pr:
-                print(f"[coding_node] [{repo_full_name}] Open PR #{existing_pr.pr_number} already exists — skipping.")
-                return {
-                    "repo_full_name": repo_full_name,
-                    "branch_name": branch_name,
-                    "pr_number": existing_pr.pr_number,
-                    "pr_url": existing_pr.pr_url,
-                    "head_sha": existing_pr.head_sha,
-                    "is_draft": existing_pr.is_draft,
-                    "known_comment_ids": list(existing_pr_map[repo_full_name].get("known_comment_ids") or []),
-                }
+            existing_pr_data = existing_pr_map[repo_full_name]
+            print(f"[coding_node] [{repo_full_name}] Open PR #{existing_pr_data['pr_number']} already exists — skipping.")
+            return dict(existing_pr_data)
 
-        local_path = clone_repo(repo_full_name, branch_name)
+        # Reuse existing local_path from a prior run when available to skip re-cloning
+        existing_local_path = (existing_pr_map.get(repo_full_name) or {}).get("local_path")
+        if existing_local_path and Path(existing_local_path).exists():
+            print(f"[coding_node] [{repo_full_name}] Reusing existing checkout at {existing_local_path}")
+            local_path = existing_local_path
+            from github_client import _run_git as _rg
+            try:
+                _rg("fetch", "origin", cwd=local_path)
+                _rg("reset", "--hard", f"origin/{branch_name}", cwd=local_path)
+            except Exception as _e:
+                print(f"[coding_node] [{repo_full_name}] Could not update checkout ({_e}), re-cloning.")
+                local_path = clone_repo(repo_full_name, branch_name)
+        else:
+            local_path = clone_repo(repo_full_name, branch_name)
 
-        # Build review feedback string scoped to this repo only
         repo_comments = comments_by_repo.get(repo_full_name, [])
         repo_review_feedback: str | None = None
         if is_review_round and repo_comments:
@@ -535,45 +552,70 @@ def review_watcher_node(state: AgentState) -> AgentState:
         return {**state, "status": "done"}
 
     try:
+        def _poll_pr(pr_data: dict) -> dict:
+            """Poll a single PR: check state + new comments. Returns result dict."""
+            _repo = pr_data["repo_full_name"]
+            _pr_number = pr_data["pr_number"]
+
+            pr_info = get_pr_state(_repo, _pr_number)
+            if pr_info["is_terminal"]:
+                return {"pr_data": pr_data, "terminal": True, "state_str": pr_info["state"], "new_comments": []}
+
+            new: list[dict] = []
+            known_ids: set[int] = set(pr_data.get("known_comment_ids") or [])
+            has_new, new_comments = has_new_comments_since(_repo, _pr_number, known_ids)
+            if has_new:
+                for c in new_comments:
+                    new.append({
+                        "repo": _repo,
+                        "pr_number": c.pr_number,
+                        "comment_id": c.comment_id,
+                        "author": c.author,
+                        "body": c.body,
+                        "path": c.path,
+                        "line": c.line,
+                    })
+
+            return {
+                "pr_data": pr_data,
+                "terminal": False,
+                "state_str": pr_info["state"],
+                "still_draft": pr_info["is_draft"],
+                "new_comments": new,
+            }
+
         while True:
             all_terminal = True
             new_comments_found: list[dict] = []
 
-            for pr_data in prs:
-                repo_full_name = pr_data["repo_full_name"]
-                pr_number = pr_data["pr_number"]
+            with ThreadPoolExecutor(max_workers=max(len(prs), 1)) as executor:
+                poll_futures = {executor.submit(_poll_pr, pr_data): pr_data for pr_data in prs}
+                for future in as_completed(poll_futures):
+                    exc = future.exception()
+                    if exc:
+                        print(f"[review_watcher] Error polling PR: {exc}")
+                        all_terminal = False
+                        continue
+                    result = future.result()
+                    pr_data = result["pr_data"]
+                    pr_number = pr_data["pr_number"]
 
-                # Check merged / closed
-                is_terminal, pr_state = is_pr_merged_or_closed(repo_full_name, pr_number)
-                if is_terminal:
-                    if pr_state == "MERGED":
-                        print(f"[review_watcher] PR #{pr_number} merged. ✓")
-                    else:
-                        print(f"[review_watcher] PR #{pr_number} was closed without merging.")
-                    continue
+                    if result["terminal"]:
+                        state_str = result["state_str"]
+                        if state_str == "MERGED":
+                            print(f"[review_watcher] PR #{pr_number} merged. ✓")
+                        else:
+                            print(f"[review_watcher] PR #{pr_number} was closed without merging.")
+                        continue
 
-                # Track draft→ready promotion but always monitor comments regardless of draft state
-                still_draft = is_pr_draft(repo_full_name, pr_number)
-                if pr_data.get("is_draft", False) and not still_draft:
-                    print(f"[review_watcher] PR #{pr_number} is now ready for review — continuing to watch for comments.")
-                    pr_data["is_draft"] = False
+                    all_terminal = False
 
-                all_terminal = False
-                known_ids = set(pr_data.get("known_comment_ids") or [])
-                has_new, new_comments = has_new_comments_since(repo_full_name, pr_number, known_ids)
+                    still_draft = result.get("still_draft", pr_data.get("is_draft", False))
+                    if pr_data.get("is_draft", False) and not still_draft:
+                        print(f"[review_watcher] PR #{pr_number} is now ready for review — continuing to watch for comments.")
+                        pr_data["is_draft"] = False
 
-                if has_new:
-                    for c in new_comments:
-                        new_comments_found.append({
-                            "repo": repo_full_name,
-                            "pr_number": c.pr_number,
-                            "comment_id": c.comment_id,
-                            "author": c.author,
-                            "body": c.body,
-                            "path": c.path,
-                            "line": c.line,
-                        })
-                    # Do NOT add to known_comment_ids here — only mark known after coding addresses them
+                    new_comments_found.extend(result["new_comments"])
 
             if all_terminal:
                 print("[review_watcher] All PRs are merged, closed, or ready for review. Done.")

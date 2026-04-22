@@ -60,7 +60,6 @@ def run_coding_agent(
         [
             config.CLAUDE_CLI_PATH,
             "--print",
-            "--debug",
             "--permission-mode", "bypassPermissions",
             "--allowedTools", "Bash", "Read", "Write", "Edit", "MultiEdit", "Glob", "Grep", "LS",
         ],

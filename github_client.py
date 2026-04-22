@@ -209,10 +209,10 @@ def create_pull_request(
     local_repo_path: str | None = None,
 ) -> PRInfo:
     """
-    Create a draft GitHub PR using `gh pr create`.
+    Create a GitHub PR using `gh pr create`.
     Closed PRs are ignored — if one exists the remote branch may have been
     deleted when it was closed, so we re-push from the local checkout before
-    creating a fresh draft PR.
+    creating a fresh PR.
     Returns PRInfo.
     """
     # When a closed PR exists, GitHub may have deleted the remote branch.
@@ -234,7 +234,7 @@ def create_pull_request(
             "--base", config.GITHUB_BASE_BRANCH,
             "--title", title,
             "--body", body,
-            "--draft",
+    
         )
     except RuntimeError as e:
         # PR may already exist — that's fine, proceed to fetch its metadata
@@ -369,28 +369,36 @@ def has_new_comments_since(
     return len(new) > 0, new
 
 
+def get_pr_state(repo_full_name: str, pr_number: int) -> dict:
+    """
+    Fetch state + isDraft in a single gh call.
+    Returns dict with keys: 'state' (str, uppercase), 'is_draft' (bool), 'is_terminal' (bool).
+    """
+    pr_json = _run_gh(
+        "pr", "view", str(pr_number),
+        "--repo", repo_full_name,
+        "--json", "state,isDraft",
+    )
+    data = json.loads(pr_json)
+    state = data.get("state", "OPEN").upper()
+    is_draft = data.get("isDraft", False)
+    return {
+        "state": state,
+        "is_draft": is_draft,
+        "is_terminal": state in ("CLOSED", "MERGED"),
+    }
+
+
 def is_pr_merged_or_closed(repo_full_name: str, pr_number: int) -> tuple[bool, str]:
     """
     Returns (is_terminal, state) where state is 'MERGED', 'CLOSED', or 'OPEN'.
     is_terminal is True when the PR is no longer open (merged or closed).
     """
-    state = _run_gh(
-        "pr", "view", str(pr_number),
-        "--repo", repo_full_name,
-        "--json", "state",
-        "--jq", ".state",
-    )
-    state = state.upper()
-    return state in ("CLOSED", "MERGED"), state
+    info = get_pr_state(repo_full_name, pr_number)
+    return info["is_terminal"], info["state"]
 
 
 def is_pr_draft(repo_full_name: str, pr_number: int) -> bool:
     """Returns True if the PR is still in draft state."""
-    result = _run_gh(
-        "pr", "view", str(pr_number),
-        "--repo", repo_full_name,
-        "--json", "isDraft",
-        "--jq", ".isDraft",
-    )
-    return result.strip().lower() == "true"
+    return get_pr_state(repo_full_name, pr_number)["is_draft"]
 

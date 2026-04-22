@@ -1,7 +1,7 @@
 # j2p — JIRA to PR
 
 An AI agent that reads a JIRA ticket, implements the required code changes using the **locally installed Claude Code CLI
-**, opens a draft GitHub PR via the **local `gh` CLI**, and continuously addresses PR review comments until the PR is
+**, opens a GitHub PR via the **local `gh` CLI**, and continuously addresses PR review comments until the PR is
 merged or closed.
 
 No API tokens or API keys are required — all authentication is handled by your locally installed tooling.
@@ -31,7 +31,7 @@ No API tokens or API keys are required — all authentication is handled by your
 
 **Review loop:** after a PR is created, `review_watcher_node` polls for new comments. When comments arrive,
 `coding_node` re-runs to address them, commits, pushes, and replies to each comment with the fixing commit SHA. Stops
-when the PR is marked ready (no longer draft), closed, merged, or `MAX_REVIEW_ITERATIONS` is reached.
+when the PR is closed, merged, or `MAX_REVIEW_ITERATIONS` is reached.
 
 ## Workflow
 
@@ -44,7 +44,7 @@ when the PR is marked ready (no longer draft), closed, merged, or `MAX_REVIEW_IT
    Loops until all required information is provided.
 4. **coding_node** — invokes `claude --print` inside each repo. Claude Code explores the codebase and implements all
    required changes, then outputs a commit message.
-5. **pr_node** — commits, pushes the branch, and creates a **draft** PR via `gh pr create`.
+5. **pr_node** — commits, pushes the branch, and creates a PR via `gh pr create`.
 6. **review_watcher_node** — polls the PR for new review comments. Feeds them back to `coding_node` for fixes. Replies
    to each addressed comment with the commit SHA so it is not re-processed on the next run.
 
