@@ -10,6 +10,7 @@ class JiraTicket:
     repos: List[str]  # extracted GitHub repo full names e.g. ["org/repo1", "org/repo2"]
     labels: List[str] = field(default_factory=list)
     assignee: Optional[str] = None
+    comments: List[str] = field(default_factory=list)  # ticket comments (author: body)
 
 
 @dataclass
@@ -48,11 +49,6 @@ class AgentState(TypedDict, total=False):
     # JIRA data
     jira_ticket: Optional[dict]
 
-    # Per-repo working state (keyed by repo full name)
-    current_repo: Optional[str]
-    branch_name: Optional[str]
-    local_repo_path: Optional[str]
-
     # PR tracking
     prs: Optional[List[dict]]           # list of PRInfo dicts
     review_comments: Optional[List[dict]]  # latest unresolved review comments
@@ -66,9 +62,5 @@ class AgentState(TypedDict, total=False):
     # Clarification support
     missing_info: Optional[List[dict]]  # list of MissingInfo dicts (serialised)
 
-    # LLM conversation history for coding context
-    coding_messages: Optional[List[dict]]
-
     # Repos explicitly supplied via CLI (override / supplement ticket repos)
     extra_repos: Optional[List[str]]
-

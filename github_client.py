@@ -259,18 +259,6 @@ def create_pull_request(
     )
 
 
-def update_pull_request_body(repo_full_name: str, pr_number: int, body: str) -> None:
-    _run_gh(
-        "pr", "edit", str(pr_number),
-        "--repo", repo_full_name,
-        "--body", body,
-    )
-
-
-# ---------------------------------------------------------------------------
-# PR Review Comments
-# ---------------------------------------------------------------------------
-
 def get_pr_review_comments(repo_full_name: str, pr_number: int) -> list[ReviewComment]:
     """
     Fetch all review comments + general PR comments via `gh api`.
@@ -369,6 +357,42 @@ def has_new_comments_since(
     return len(new) > 0, new
 
 
+def get_pr_checks_status(repo_full_name: str, pr_number: int) -> dict:
+    """
+    Returns a summary of all CI checks for a PR.
+    Keys: total, passed, failed, pending, all_passed (bool).
+    """
+    try:
+        checks_json = _run_gh(
+            "pr", "checks", str(pr_number),
+            "--repo", repo_full_name,
+            "--json", "name,state,conclusion",
+        )
+    except RuntimeError:
+        # No checks configured — treat as passed
+        return {"total": 0, "passed": 0, "failed": 0, "pending": 0, "all_passed": True}
+
+    checks = json.loads(checks_json)
+    total = len(checks)
+    passed = failed = pending = 0
+    for c in checks:
+        conclusion = (c.get("conclusion") or "").lower()
+        if conclusion in ("success", "neutral", "skipped"):
+            passed += 1
+        elif conclusion in ("failure", "cancelled", "timed_out", "action_required"):
+            failed += 1
+        else:
+            pending += 1  # in_progress / queued / ""
+
+    return {
+        "total": total,
+        "passed": passed,
+        "failed": failed,
+        "pending": pending,
+        "all_passed": total > 0 and failed == 0 and pending == 0,
+    }
+
+
 def get_pr_state(repo_full_name: str, pr_number: int) -> dict:
     """
     Fetch state + isDraft in a single gh call.
@@ -387,18 +411,4 @@ def get_pr_state(repo_full_name: str, pr_number: int) -> dict:
         "is_draft": is_draft,
         "is_terminal": state in ("CLOSED", "MERGED"),
     }
-
-
-def is_pr_merged_or_closed(repo_full_name: str, pr_number: int) -> tuple[bool, str]:
-    """
-    Returns (is_terminal, state) where state is 'MERGED', 'CLOSED', or 'OPEN'.
-    is_terminal is True when the PR is no longer open (merged or closed).
-    """
-    info = get_pr_state(repo_full_name, pr_number)
-    return info["is_terminal"], info["state"]
-
-
-def is_pr_draft(repo_full_name: str, pr_number: int) -> bool:
-    """Returns True if the PR is still in draft state."""
-    return get_pr_state(repo_full_name, pr_number)["is_draft"]
 

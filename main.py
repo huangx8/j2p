@@ -67,16 +67,12 @@ def main():
     initial_state = {
         "jira_ticket_key": args.ticket,
         "jira_ticket": None,
-        "current_repo": None,
-        "branch_name": None,
-        "local_repo_path": None,
         "prs": None,
         "review_comments": None,
         "review_iteration": 0,
         "status": "init",
         "error_message": None,
         "missing_info": None,
-        "coding_messages": None,
         "extra_repos": extra_repos or None,
     }
 

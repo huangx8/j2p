@@ -124,62 +124,70 @@ def extract_repos_from_text(text: str) -> list[str]:
     return list(repos)
 
 
-def build_agent_prompt(sections: dict[str, str], summary: str, description: str) -> str:
+def build_agent_prompt(sections: dict[str, str], summary: str, description: str, comments: list[str] | None = None) -> str:
     """
     Build a structured prompt for the coding agent from parsed template sections.
     Falls back to the raw description if no template sections are detected.
+    Appends ticket comments (if any) so the agent has full context.
     """
     if not sections:
-        return description
+        base = description
+    else:
+        known_headings = {
+            "summary", "background / context", "background", "context",
+            "affected repositories", "repositories", "repos",
+            "required changes", "changes required", "changes",
+            "acceptance criteria", "acceptance", "criteria",
+            "technical notes", "technical", "notes", "implementation notes",
+            "test instructions", "testing", "tests",
+            "dependencies / blockers", "dependencies", "blockers",
+        }
 
-    known_headings = {
-        "summary", "background / context", "background", "context",
-        "affected repositories", "repositories", "repos",
-        "required changes", "changes required", "changes",
-        "acceptance criteria", "acceptance", "criteria",
-        "technical notes", "technical", "notes", "implementation notes",
-        "test instructions", "testing", "tests",
-        "dependencies / blockers", "dependencies", "blockers",
-    }
+        parts = [f"## Ticket Summary\n{summary}"]
 
-    parts = [f"## Ticket Summary\n{summary}"]
+        for heading in ("background / context", "background", "context"):
+            if heading in sections and sections[heading]:
+                parts.append(f"## Background\n{_strip_placeholder_lines(sections[heading])}")
+                break
 
-    for heading in ("background / context", "background", "context"):
-        if heading in sections and sections[heading]:
-            parts.append(f"## Background\n{_strip_placeholder_lines(sections[heading])}")
-            break
+        changes_parts = []
+        for heading in ("required changes", "changes required", "changes"):
+            if heading in sections:
+                body = _strip_placeholder_lines(sections[heading])
+                if body:
+                    changes_parts.append(body)
+                break
 
-    changes_parts = []
-    for heading in ("required changes", "changes required", "changes"):
-        if heading in sections:
-            body = _strip_placeholder_lines(sections[heading])
-            if body:
-                changes_parts.append(body)
-            break
+        for heading, body in sections.items():
+            if heading not in known_headings and body:
+                changes_parts.append(f"### {heading.title()}\n{_strip_placeholder_lines(body)}")
 
-    for heading, body in sections.items():
-        if heading not in known_headings and body:
-            changes_parts.append(f"### {heading.title()}\n{_strip_placeholder_lines(body)}")
+        if changes_parts:
+            parts.append("## Required Changes\n" + "\n\n".join(changes_parts))
 
-    if changes_parts:
-        parts.append("## Required Changes\n" + "\n\n".join(changes_parts))
+        for heading in ("acceptance criteria", "acceptance", "criteria"):
+            if heading in sections and sections[heading]:
+                parts.append(f"## Acceptance Criteria\n{_strip_placeholder_lines(sections[heading])}")
+                break
 
-    for heading in ("acceptance criteria", "acceptance", "criteria"):
-        if heading in sections and sections[heading]:
-            parts.append(f"## Acceptance Criteria\n{_strip_placeholder_lines(sections[heading])}")
-            break
+        for heading in ("technical notes", "technical", "notes", "implementation notes"):
+            if heading in sections and sections[heading]:
+                parts.append(f"## Technical Notes\n{_strip_placeholder_lines(sections[heading])}")
+                break
 
-    for heading in ("technical notes", "technical", "notes", "implementation notes"):
-        if heading in sections and sections[heading]:
-            parts.append(f"## Technical Notes\n{_strip_placeholder_lines(sections[heading])}")
-            break
+        for heading in ("test instructions", "testing", "tests"):
+            if heading in sections and sections[heading]:
+                parts.append(f"## Test Instructions\n{_strip_placeholder_lines(sections[heading])}")
+                break
 
-    for heading in ("test instructions", "testing", "tests"):
-        if heading in sections and sections[heading]:
-            parts.append(f"## Test Instructions\n{_strip_placeholder_lines(sections[heading])}")
-            break
+        base = "\n\n".join(parts)
 
-    return "\n\n".join(parts)
+    # Append ticket comments if present
+    if comments:
+        comment_block = "\n".join(f"- {c}" for c in comments)
+        base = f"{base}\n\n## Ticket Comments\n{comment_block}"
+
+    return base
 
 
 def fetch_jira_ticket(ticket_key: str, max_retries: int = 3, retry_delay: float = 5.0) -> JiraTicket:
@@ -189,9 +197,10 @@ def fetch_jira_ticket(ticket_key: str, max_retries: int = 3, retry_delay: float 
     Retries up to max_retries times on failure (MCP can be unstable).
     """
     prompt = (
-        f"Use the atlassian MCP to fetch ticket {ticket_key}. "
+        f"Use the atlassian MCP to fetch ticket {ticket_key} including all its comments. "
         f"Return ONLY a JSON object with exactly these keys: "
-        f"summary, description, labels (array of strings), assignee (string or null). "
+        f"summary, description, labels (array of strings), assignee (string or null), "
+        f"comments (array of strings in the format 'Author: comment body', ordered oldest first). "
         f"No explanation, no markdown fences - raw JSON only."
     )
 
@@ -217,6 +226,7 @@ def fetch_jira_ticket(ticket_key: str, max_retries: int = 3, retry_delay: float 
         description = data.get("description", "")
         labels = data.get("labels", [])
         assignee = data.get("assignee")
+        comments: list[str] = data.get("comments", [])
 
         sections = _extract_sections(description)
 
@@ -229,7 +239,7 @@ def fetch_jira_ticket(ticket_key: str, max_retries: int = 3, retry_delay: float 
             repos = extract_repos_from_text(description)
 
         repos = list(set(repos))
-        agent_description = build_agent_prompt(sections, summary, description)
+        agent_description = build_agent_prompt(sections, summary, description, comments)
 
         return JiraTicket(
             key=ticket_key,
@@ -238,6 +248,7 @@ def fetch_jira_ticket(ticket_key: str, max_retries: int = 3, retry_delay: float 
             repos=repos,
             labels=labels,
             assignee=assignee,
+            comments=comments,
         )
 
     raise RuntimeError(

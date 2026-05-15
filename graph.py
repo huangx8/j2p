@@ -15,9 +15,8 @@ from github_client import (
     create_pull_request,
     find_existing_pr,
     get_pr_state,
+    get_pr_checks_status,
     has_new_comments_since,
-    is_pr_merged_or_closed,
-    is_pr_draft,
     reply_to_review_comment,
     reply_to_issue_comment,
 )
@@ -155,7 +154,6 @@ def jira_node(state: AgentState) -> AgentState:
             "missing_info": [],
             "review_iteration": 0,
             "status": "pr_created",
-            "coding_messages": [],
         }
 
     missing = detect_missing_info(ticket)
@@ -178,7 +176,6 @@ def jira_node(state: AgentState) -> AgentState:
             "prs": [],
             "review_iteration": 0,
             "status": "needs_clarification",
-            "coding_messages": [],
         }
 
     print(f"[jira_node] Found repos: {ticket.repos}")
@@ -195,7 +192,6 @@ def jira_node(state: AgentState) -> AgentState:
         "prs": [],
         "review_iteration": 0,
         "status": "coding",
-        "coding_messages": [],
     }
 
 
@@ -465,7 +461,6 @@ def coding_node(state: AgentState) -> AgentState:
     return {
         **state,
         "prs": updated_prs,
-        "coding_messages": [],
         "status": "pr_pending",
     }
 
@@ -559,11 +554,19 @@ def review_watcher_node(state: AgentState) -> AgentState:
 
             pr_info = get_pr_state(_repo, _pr_number)
             if pr_info["is_terminal"]:
-                return {"pr_data": pr_data, "terminal": True, "state_str": pr_info["state"], "new_comments": []}
+                return {"pr_data": pr_data, "terminal": True, "state_str": pr_info["state"], "new_comments": [], "checks": {}}
 
+            # Fetch comments and CI checks concurrently
             new: list[dict] = []
+            checks: dict = {}
             known_ids: set[int] = set(pr_data.get("known_comment_ids") or [])
-            has_new, new_comments = has_new_comments_since(_repo, _pr_number, known_ids)
+
+            with ThreadPoolExecutor(max_workers=2) as _inner:
+                f_comments = _inner.submit(has_new_comments_since, _repo, _pr_number, known_ids)
+                f_checks = _inner.submit(get_pr_checks_status, _repo, _pr_number)
+                has_new, new_comments = f_comments.result()
+                checks = f_checks.result()
+
             if has_new:
                 for c in new_comments:
                     new.append({
@@ -581,6 +584,7 @@ def review_watcher_node(state: AgentState) -> AgentState:
                 "terminal": False,
                 "state_str": pr_info["state"],
                 "still_draft": pr_info["is_draft"],
+                "checks": checks,
                 "new_comments": new,
             }
 
@@ -614,6 +618,15 @@ def review_watcher_node(state: AgentState) -> AgentState:
                     if pr_data.get("is_draft", False) and not still_draft:
                         print(f"[review_watcher] PR #{pr_number} is now ready for review — continuing to watch for comments.")
                         pr_data["is_draft"] = False
+
+                    checks = result.get("checks", {})
+                    if checks.get("total", 0) > 0:
+                        if checks.get("failed", 0) > 0:
+                            print(f"[review_watcher] [{pr_data['repo_full_name']}] PR #{pr_number} ⚠  {checks['failed']} check(s) FAILED, {checks['pending']} pending")
+                        elif checks.get("pending", 0) > 0:
+                            print(f"[review_watcher] [{pr_data['repo_full_name']}] PR #{pr_number} ⏳ {checks['pending']} check(s) running ({checks['passed']} passed)")
+                        else:
+                            print(f"[review_watcher] [{pr_data['repo_full_name']}] PR #{pr_number} ✅ All {checks['passed']} check(s) passed.")
 
                     new_comments_found.extend(result["new_comments"])
 
