@@ -19,6 +19,7 @@ from github_client import (
     has_new_comments_since,
     reply_to_review_comment,
     reply_to_issue_comment,
+    verify_repo_exists,
 )
 from coding_agent import run_coding_agent
 
@@ -50,6 +51,30 @@ def _prompt_multiline(prompt_text: str) -> str:
     return "\n".join(lines).strip()
 
 
+def _filter_valid_repos(repos: list[str]) -> list[str]:
+    """
+    Verify each repo exists on GitHub concurrently and return only the valid ones.
+    Invalid/inaccessible repos are logged and dropped.
+    """
+    if not repos:
+        return []
+
+    valid: list[str] = []
+    with ThreadPoolExecutor(max_workers=max(len(repos), 1)) as executor:
+        futures = {executor.submit(verify_repo_exists, r): r for r in repos}
+        for future in as_completed(futures):
+            repo = futures[future]
+            if future.result():
+                valid.append(repo)
+            else:
+                print(f"[repo_verify] ⚠  Repo '{repo}' not found or not accessible — skipping.")
+
+    # Preserve original order
+    order = {r: i for i, r in enumerate(repos)}
+    valid.sort(key=lambda r: order.get(r, 999))
+    return valid
+
+
 def pr_check_node(state: AgentState) -> AgentState:
     """
     Check whether an open PR already exists for this ticket's branch,
@@ -68,6 +93,12 @@ def pr_check_node(state: AgentState) -> AgentState:
             repos_to_check.append(r)
 
     if not repos_to_check:
+        return {**state, "status": "init"}
+
+    # Validate repos before doing any PR lookups
+    repos_to_check = _filter_valid_repos(repos_to_check)
+    if not repos_to_check:
+        print("[pr_check_node] No valid repos found — proceeding to jira_node.")
         return {**state, "status": "init"}
 
     def _check_repo_pr(repo_full_name: str) -> dict | None:
@@ -121,6 +152,13 @@ def jira_node(state: AgentState) -> AgentState:
         merged = list(dict.fromkeys(extra_repos + ticket.repos))
         print(f"[jira_node] Merging CLI repos {extra_repos} with ticket repos {ticket.repos} → {merged}")
         ticket.repos = merged
+
+    # Verify all repos are accessible before proceeding
+    if ticket.repos:
+        print(f"[jira_node] Verifying {len(ticket.repos)} repo(s) ...")
+        ticket.repos = _filter_valid_repos(ticket.repos)
+        if not ticket.repos:
+            print("[jira_node] No valid repos found after verification — treating as missing.")
 
     # After fetching the ticket, check if an open PR already exists for any repo.
     # If so, skip coding entirely and go straight to review watching.
@@ -233,6 +271,9 @@ def clarification_node(state: AgentState) -> AgentState:
                 print(f"  ⚠  Could not qualify bare repo name(s) {invalid} — set GITHUB_DEFAULT_ORG or use 'org/repo' format.")
             existing = ticket.get("repos") or []
             ticket["repos"] = list(dict.fromkeys(existing + valid))
+            # Verify the newly added repos are actually accessible
+            print(f"[clarification_node] Verifying {len(ticket['repos'])} repo(s) ...")
+            ticket["repos"] = _filter_valid_repos(ticket["repos"])
             print(f"  ✓  Repos updated: {ticket['repos']}")
 
         elif field == "required_changes":

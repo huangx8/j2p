@@ -393,6 +393,18 @@ def get_pr_checks_status(repo_full_name: str, pr_number: int) -> dict:
     }
 
 
+def verify_repo_exists(repo_full_name: str) -> bool:
+    """
+    Return True if *repo_full_name* exists and is accessible via `gh repo view`.
+    Fast single API call — used to validate repos extracted from JIRA before cloning.
+    """
+    try:
+        _run_gh("repo", "view", repo_full_name, "--json", "name", retries=1)
+        return True
+    except RuntimeError:
+        return False
+
+
 def get_pr_state(repo_full_name: str, pr_number: int) -> dict:
     """
     Fetch state + isDraft in a single gh call.
